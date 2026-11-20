@@ -13,6 +13,14 @@
 5. 缓存只在进程内存中，不写磁盘；进程/容器重启后缓存为空。
 6. 附带 HTTP 状态接口（STATS_PORT）：每个名字的回源次数、缓存种类、剩余 TTL、
    最近错误、是否正在回源等，供网页展示。
+7. 退役绑定拦截（A 记录退役后）：
+   - 每发出一个含 A 记录的答复，就把 (name, ip, 发包时刻, 报文 TTL) 追加到
+     SQLite 的 answer_log（共享卷，重启不丢），供网页端计算地址保留期；
+   - 缓存命中前：若 (name, ip) 在退役名册中（已退役且当前无同名同 IP 的
+     现行记录），该缓存条目视为失效，重新回源，绝不再发出旧绑定；
+   - 回源写缓存前：若回包含有已退役的 (name, ip) 绑定（退役前权威发出、
+     退役后才到达的“迟到回包”），丢弃并立即重新回源一次；重试仍是旧绑定
+     则不缓存、回 SERVFAIL，绝不把旧绑定发给客户端。
 """
 import json
 import random
@@ -25,7 +33,7 @@ from typing import Optional
 
 from dnslib import QTYPE, RCODE, DNSRecord
 
-from . import config
+from . import config, db
 
 
 class Flight:
@@ -67,6 +75,43 @@ class CachingResolver:
         self.total_queries = 0
         self.upstream_failures = 0
         self.last_error: dict[str, str] = {}
+        # 退役相关计数：缓存拦截次数 / 迟到旧回包丢弃次数 / 答复日志写失败次数
+        self.retired_blocks = 0
+        self.late_drops = 0
+        self.answer_log_failures = 0
+
+    # ---------- 退役名册（SQLite，共享卷，重启不丢） ----------
+
+    def _retired_pairs(self) -> set[tuple[str, str]]:
+        """当前生效的 (name, ip) 退役绑定。
+
+        DB 读失败时放行（fail-open）并计数：SQLite 与权威同卷，正常不会失败；
+        失败时权威回源同样不可用，故障路径仍回 SERVFAIL。
+        """
+        try:
+            return db.active_retired_pairs()
+        except Exception as exc:  # noqa: BLE001
+            with self.lock:
+                self.answer_log_failures += 1
+                self.last_error["__retired_lookup__"] = repr(exc)
+            return set()
+
+    def _entry_retired(self, key: str, entry: CacheEntry) -> bool:
+        """缓存条目是否是被退役的 (name, ip) 旧绑定。"""
+        if entry.kind != "positive":
+            return False
+        pairs = self._retired_pairs()
+        return any((key, ip) in pairs for ip in entry.rdata)
+
+    def _reply_retired(self, qname: str, resp: DNSRecord) -> bool:
+        """权威回包是否含有已退役的 (name, ip) 绑定（迟到的旧回包）。"""
+        if int(resp.header.rcode) != RCODE.NOERROR:
+            return False
+        ips = [str(rr.rdata) for rr in resp.rr if rr.rtype == QTYPE.A]
+        if not ips:
+            return False
+        pairs = self._retired_pairs()
+        return any((qname, ip) in pairs for ip in ips)
 
     # ---------- 上游 ----------
 
@@ -155,8 +200,15 @@ class CachingResolver:
         for _ in range(2):
             with self.lock:
                 entry = self.cache.get(key)
-                if entry is not None and entry.fresh():
-                    return self._from_entry(query, entry)
+                fresh = entry is not None and entry.fresh()
+            # 退役检查要读 SQLite，必须在锁外进行（异常路径会再取锁计数）
+            if fresh and not self._entry_retired(key, entry):
+                return self._from_entry(query, entry)
+            if fresh:
+                # 缓存是被退役的旧绑定：视为失效，绝不再次发出
+                with self.lock:
+                    self.retired_blocks += 1
+            with self.lock:
                 flight = self.inflight.get(key)
                 if flight is None:
                     flight = Flight()
@@ -173,14 +225,20 @@ class CachingResolver:
             signaled = flight.event.wait(timeout=config.UPSTREAM_TIMEOUT + 2.0)
             with self.lock:
                 entry = self.cache.get(key)
-                if entry is not None and entry.fresh():
-                    return self._from_entry(query, entry)
+                fresh = entry is not None and entry.fresh()
                 if signaled and flight.error is None and key not in self.inflight:
-                    # leader 正常结束却没有可缓存内容：按失败处理
-                    return self._servfail(query)
-                if flight.error is not None:
-                    return self._servfail(query)
-                # 否则本轮等待超时，进入下一轮（不会取消任何其他等待者）
+                    leader_done_empty = True
+                else:
+                    leader_done_empty = False
+                flight_error = flight.error is not None
+            if fresh and not self._entry_retired(key, entry):
+                return self._from_entry(query, entry)
+            if leader_done_empty:
+                # leader 正常结束却没有可缓存内容：按失败处理
+                return self._servfail(query)
+            if flight_error:
+                return self._servfail(query)
+            # 否则本轮等待超时，进入下一轮（不会取消任何其他等待者）
         return self._servfail(query)
 
     def _run_leader(self, query: DNSRecord, key: str, qname: str, qtype: str, flight: Flight) -> DNSRecord:
@@ -188,6 +246,21 @@ class CachingResolver:
             with self.lock:
                 self.attempts[key] = self.attempts.get(key, 0) + 1
             resp = self._fetch_upstream(qname, qtype)
+            if self._reply_retired(qname, resp):
+                # 迟到的旧回包（退役前权威已发出、退役后才到达）：丢弃，
+                # 立即重新回源拿权威当前状态，绝不缓存也绝不发给客户端。
+                with self.lock:
+                    self.late_drops += 1
+                    self.attempts[key] = self.attempts.get(key, 0) + 1
+                resp = self._fetch_upstream(qname, qtype)
+                if self._reply_retired(qname, resp):
+                    # 重试仍是旧绑定（极端）：不缓存、不发出，回 SERVFAIL
+                    with self.lock:
+                        self.late_drops += 1
+                        self.upstream_failures += 1
+                        self.last_error[key] = "retired binding in late upstream reply"
+                    flight.error = "retired binding in late upstream reply"
+                    return self._servfail(query)
             try:
                 entry = self._store_reply(key, qname, resp)
             except ValueError as exc:
@@ -225,6 +298,30 @@ class CachingResolver:
         with self.lock:
             self.total_queries += 1
 
+    # ---------- 答复日志（地址保留期的依据） ----------
+
+    def log_sent_answers(self, reply: DNSRecord) -> None:
+        """把刚发出的答复中的 A 绑定写入 answer_log（发包时刻 + 报文 TTL）。
+
+        客户端按 (sent_at + ttl) 持有旧答复；退役时取其最大值作为保留期。
+        写失败不影响 DNS 应答本身，只计数（保留期计算会相应退化，见 README）。
+        """
+        try:
+            if int(reply.header.rcode) != RCODE.NOERROR:
+                return
+            now = time.time()
+            rows = [
+                (str(rr.rname).lower().rstrip("."), str(rr.rdata), now, int(rr.ttl))
+                for rr in reply.rr
+                if rr.rtype == QTYPE.A
+            ]
+            if rows:
+                db.log_answers(rows)
+        except Exception as exc:  # noqa: BLE001
+            with self.lock:
+                self.answer_log_failures += 1
+                self.last_error["__answer_log__"] = repr(exc)
+
     # ---------- 状态快照 ----------
 
     def snapshot(self, name: Optional[str] = None) -> dict:
@@ -232,33 +329,46 @@ class CachingResolver:
             names = set(self.cache) | set(self.attempts) | set(self.inflight) | set(self.last_error)
             if name:
                 names = {name}
-            per_name = {}
-            for n in sorted(names):
-                entry = self.cache.get(n)
-                flight = self.inflight.get(n)
-                per_name[n] = {
-                    "name": n,
-                    "upstream_attempts": self.attempts.get(n, 0),
-                    "inflight": flight is not None,
-                    "inflight_waiters": flight.waiters if flight else 0,
-                    "inflight_age_ms": int((time.time() - flight.started_at) * 1000) if flight else 0,
-                    "cached": entry is not None and entry.fresh(),
-                    "expired": entry is not None and not entry.fresh(),
-                    "cache_kind": entry.kind if entry else None,
-                    "rcode": entry.rcode if entry else None,
-                    "rdata": entry.rdata if entry else [],
-                    "ttl_original": entry.ttl if entry else None,
-                    "ttl_remaining": entry.remaining() if entry else None,
-                    "cached_at": entry.stored_wall if entry else None,
-                    "last_error": self.last_error.get(n),
-                }
-            return {
-                "total_queries": self.total_queries,
-                "upstream_failures": self.upstream_failures,
-                "upstream": f"{config.UPSTREAM_HOST}:{config.UPSTREAM_PORT}",
-                "upstream_timeout_s": config.UPSTREAM_TIMEOUT,
-                "names": per_name,
+            # 锁内只取数据快照；退役检查（读 SQLite）在锁外做
+            entries = {n: self.cache.get(n) for n in names}
+            flights = {n: self.inflight.get(n) for n in names}
+            attempts = {n: self.attempts.get(n, 0) for n in names}
+            errors = {n: self.last_error.get(n) for n in names}
+            totals = (self.total_queries, self.upstream_failures,
+                      self.retired_blocks, self.late_drops, self.answer_log_failures)
+        per_name = {}
+        for n in sorted(names):
+            entry = entries[n]
+            flight = flights[n]
+            fresh = entry is not None and entry.fresh()
+            retired = fresh and self._entry_retired(n, entry)
+            per_name[n] = {
+                "name": n,
+                "upstream_attempts": attempts[n],
+                "inflight": flight is not None,
+                "inflight_waiters": flight.waiters if flight else 0,
+                "inflight_age_ms": int((time.time() - flight.started_at) * 1000) if flight else 0,
+                "cached": fresh and not retired,
+                "expired": entry is not None and not entry.fresh(),
+                "retired_blocked": retired,
+                "cache_kind": entry.kind if entry else None,
+                "rcode": entry.rcode if entry else None,
+                "rdata": entry.rdata if entry else [],
+                "ttl_original": entry.ttl if entry else None,
+                "ttl_remaining": entry.remaining() if entry else None,
+                "cached_at": entry.stored_wall if entry else None,
+                "last_error": errors[n],
             }
+        return {
+            "total_queries": totals[0],
+            "upstream_failures": totals[1],
+            "retired_blocks": totals[2],
+            "late_drops": totals[3],
+            "answer_log_failures": totals[4],
+            "upstream": f"{config.UPSTREAM_HOST}:{config.UPSTREAM_PORT}",
+            "upstream_timeout_s": config.UPSTREAM_TIMEOUT,
+            "names": per_name,
+        }
 
 
 RESOLVER = CachingResolver()
@@ -286,6 +396,8 @@ class DNSHandler(socketserver.BaseRequestHandler):
             reply.header.set_rcode(RCODE.SERVFAIL)
         if reply is not None:
             sock.sendto(reply.pack(), self.client_address)
+            # 发包后记录答复日志：地址保留期按“发包时刻 + 报文 TTL”计算
+            RESOLVER.log_sent_answers(reply)
 
 
 class StatsHandler(BaseHTTPRequestHandler):
@@ -326,7 +438,8 @@ def main() -> None:
     print(
         f"[resolver] dns udp://{config.LISTEN_ADDR}:{config.LISTEN_PORT}, "
         f"stats http://{config.LISTEN_ADDR}:{config.STATS_PORT}, "
-        f"upstream {config.UPSTREAM_HOST}:{config.UPSTREAM_PORT} (timeout {config.UPSTREAM_TIMEOUT}s)",
+        f"upstream {config.UPSTREAM_HOST}:{config.UPSTREAM_PORT} (timeout {config.UPSTREAM_TIMEOUT}s), "
+        f"answer-log db={config.DB_PATH}",
         flush=True,
     )
     try:

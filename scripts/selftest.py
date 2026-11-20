@@ -12,7 +12,10 @@
 6. 同名并发冷查询只回源一次（singleflight），且各自 DNS ID 正确
 7. 单个等待者超时不取消回源、不影响其他等待者
 8. 慢域名不阻塞另一域名
-9. 解析器重启后缓存为空（由 scripts/selftest.sh 控制重启并调用 --restart-check）
+9. 退役：冲突拒绝 / 原子回滚 / 缓存拦截 / 保留期写入拦截 / 调低 TTL 不放行 / 到期放行
+10. 迟到的权威旧回包不得复活已退役的绑定
+11. 重启全部服务后：缓存清空、保留期不提前放行、到期后允许再分配
+    （由 scripts/selftest.sh / selftest-local.sh 控制重启并调用 --restart-check）
 """
 import json
 import os
@@ -20,6 +23,7 @@ import random
 import socket
 import sys
 import time
+import urllib.error
 import urllib.request
 
 WEB = os.environ.get("WEB_BASE", "http://127.0.0.1:8000")
@@ -54,6 +58,24 @@ def http(method: str, path: str, body=None):
         return json.loads(resp.read().decode())
 
 
+def http_status(method: str, path: str, body=None):
+    """与 http 相同，但不抛异常，返回 (status_code, body)，用于断言 4xx。"""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        WEB + path, data=data, method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            return e.code, json.loads(raw)
+        except ValueError:
+            return e.code, {"raw": raw}
+
+
 def stats(name: str) -> dict:
     with urllib.request.urlopen(
         f"http://{os.environ.get('RESOLVER_STATS_HOST', '127.0.0.1')}:"
@@ -61,6 +83,27 @@ def stats(name: str) -> dict:
         timeout=5,
     ) as resp:
         return json.loads(resp.read().decode())["names"].get(name, {})
+
+
+def full_stats() -> dict:
+    with urllib.request.urlopen(
+        f"http://{os.environ.get('RESOLVER_STATS_HOST', '127.0.0.1')}:"
+        f"{os.environ.get('RESOLVER_STATS_PORT', '8081')}/stats",
+        timeout=5,
+    ) as resp:
+        return json.loads(resp.read().decode())
+
+
+def retired_map() -> dict:
+    """当前退役保留表：ip -> 条目。"""
+    return {r["ip"]: r for r in http("GET", "/api/state").get("retired", [])}
+
+
+def domain_record(name: str):
+    for d in http("GET", "/api/state")["domains"]:
+        if d["name"] == name:
+            return d["record"]
+    return None
 
 
 def dns_query(name: str, timeout: float):
@@ -96,6 +139,10 @@ def del_record(name):
     return http("DELETE", f"/api/domains/{name}/record")
 
 
+def retire_status(name):
+    return http_status("POST", f"/api/domains/{name}/retire")
+
+
 def set_neg_ttl(ttl):
     return http("PUT", "/api/settings/neg-ttl", {"neg_ttl": ttl})
 
@@ -113,18 +160,40 @@ def answers_of(reply):
 
 
 def restart_check():
-    """阶段 9：重启后的解析器必须没有任何旧缓存。"""
-    print("\n== 9. 解析器重启后不得沿用旧缓存 ==")
-    snap = stats("")  # name='' 时返回全量
-    with urllib.request.urlopen(
-        f"http://{os.environ.get('RESOLVER_STATS_HOST', '127.0.0.1')}:"
-        f"{os.environ.get('RESOLVER_STATS_PORT', '8081')}/stats", timeout=5
-    ) as resp:
-        full = json.loads(resp.read().decode())
+    """阶段 11：重启后缓存必须为空；退役保留期不得因重启提前放行或丢失。"""
+    print("\n== 11. 重启后：缓存清空 + 保留期不提前放行 + 到期允许再分配 ==")
+    full = full_stats()
     check("重启后缓存表为空", all(not v.get("cached") for v in full["names"].values()),
           detail=str(full["names"]))
     check("重启后回源计数归零", all(v.get("upstream_attempts") == 0 for v in full["names"].values()),
           detail=str(full["names"]))
+
+    state = http("GET", "/api/state")
+    d1 = state["domains"][0]["name"]
+    final_ip = "10.0.0.10"
+    retired = {r["ip"]: r for r in state.get("retired", [])}
+    info = retired.get(final_ip)
+    check("重启后退役保留条目仍在（重启未清空保留期）", info is not None, detail=str(retired))
+    rec = [d for d in state["domains"] if d["name"] == d1][0]["record"]
+    check("重启后已撤销的记录未复活", rec is None, detail=str(rec))
+
+    if info is not None:
+        if info["remaining"] > 0:
+            code, body = http_status("POST", f"/api/domains/{d1}/record",
+                                     {"ip": final_ip, "ttl": 2})
+            check("重启后保留期内写入该地址仍被拒绝(409)", code == 409,
+                  detail=f"code={code} body={body}")
+            wait_until(info["remaining"] + 5, "保留期到期",
+                       lambda: retired_map().get(final_ip, {}).get("hold_until", float("inf")) <= time.time())
+        code, body = http_status("POST", f"/api/domains/{d1}/record",
+                                 {"ip": final_ip, "ttl": 2})
+        check("保留期到期后允许重新分配（重启未把地址卡死）", code == 200,
+              detail=f"code={code} body={body}")
+        reply, _ = dns_query(d1, 3.0)
+        check("重新分配后解析恢复正常",
+              reply is not None and reply.header.rcode == RCODE.NOERROR
+              and answers_of(reply) == [final_ip],
+              detail=str(answers_of(reply) if reply else None))
     summarize()
 
 
@@ -297,11 +366,105 @@ def main():
           detail=f"elapsed={elapsed:.2f}s")
     set_delay(d2, 0)
 
-    print("\n== 9 预备：制造缓存供重启验证 ==")
-    set_record(d1, "10.0.0.10", POS_TTL)
-    dns_query(d1, 3.0)
-    check("重启前缓存确实存在", bool(stats(d1).get("cached")), detail=str(stats(d1)))
-    print("（请用 scripts/selftest.sh 重启解析器并执行 --restart-check）")
+    print("\n== 9. 退役：冲突拒绝 / 原子回滚 / 缓存拦截 / 保留期写入拦截 / 到期放行 ==")
+    RET_IP = "10.0.0.10"
+    set_record(d1, RET_IP, 4)
+    set_record(d2, RET_IP, POS_TTL)  # d2 同时持有该地址
+    code, body = retire_status(d1)
+    check("另一现行记录仍用该地址时退役返回 409", code == 409, detail=f"code={code} body={body}")
+    rec = domain_record(d1)
+    check("冲突后 d1 记录未被删除（原子回滚）", rec is not None and rec["ip"] == RET_IP,
+          detail=str(rec))
+    check("冲突后未写入保留条目（原子回滚）", RET_IP not in retired_map(), detail=str(retired_map()))
+    set_record(d2, "10.0.0.20", POS_TTL)  # d2 让出该地址
+
+    # 让解析器真实发出一次 RET_IP 绑定（答复日志是保留期的依据）
+    wait_until(POS_TTL + 3, "d1 旧缓存到期", lambda: not stats(d1).get("cached"))
+    reply, _ = dns_query(d1, 3.0)
+    check("预备查询确实发出了 RET_IP 绑定",
+          reply is not None and answers_of(reply) == [RET_IP],
+          detail=str(answers_of(reply) if reply else None))
+
+    code, body = retire_status(d1)
+    check("退役成功", code == 200 and body.get("ok"), detail=f"code={code} body={body}")
+    hold_until = float(body.get("hold_until") or 0)
+    check("保留截止时刻在未来（覆盖已发答复的 TTL）", hold_until > time.time(), detail=str(body))
+    check("退役后记录已撤销", domain_record(d1) is None)
+    rm = retired_map()
+    check("保留条目已写入且剩余时间>0", RET_IP in rm and rm[RET_IP]["remaining"] > 0,
+          detail=str(rm))
+
+    # 退役成功后，解析器不得再从缓存发出旧绑定；权威可达时应查到撤销后的结果
+    reply, _ = dns_query(d1, 3.0)
+    check("退役后立即查询得到 NXDOMAIN 而非旧绑定",
+          reply is not None and reply.header.rcode == RCODE.NXDOMAIN and RET_IP not in answers_of(reply),
+          detail=str(answers_of(reply) if reply else None))
+    check("解析器拦截了退役缓存绑定（retired_blocks>=1）",
+          full_stats().get("retired_blocks", 0) >= 1, detail=str(full_stats()))
+
+    code, body = http_status("POST", f"/api/domains/{d2}/record", {"ip": RET_IP, "ttl": POS_TTL})
+    check("保留期内把该地址写入 d2 被拒绝(409)", code == 409, detail=f"code={code} body={body}")
+    code, body = http_status("POST", f"/api/domains/{d1}/record", {"ip": RET_IP, "ttl": POS_TTL})
+    check("保留期内写回 d1 同样被拒绝(409)", code == 409, detail=f"code={code} body={body}")
+    code, body = http_status("POST", f"/api/domains/{d1}/record", {"ip": "10.0.0.13", "ttl": POS_TTL})
+    check("保留期内写入其他地址不受影响", code == 200, detail=f"code={code} body={body}")
+
+    # 调低 TTL 相关配置不得提前放行
+    h1 = retired_map()[RET_IP]["hold_until"]
+    set_neg_ttl(1)
+    set_record(d1, "10.0.0.13", 1)
+    h2 = retired_map()[RET_IP]["hold_until"]
+    check("调低 TTL 配置后保留截止时刻不变", abs(h1 - h2) < 0.01, detail=f"{h1} vs {h2}")
+    set_neg_ttl(NEG_TTL)
+
+    wait_until(max(1.0, hold_until - time.time()) + 5, "保留期到期",
+               lambda: retired_map().get(RET_IP, {}).get("hold_until", float("inf")) <= time.time())
+    code, body = http_status("POST", f"/api/domains/{d1}/record", {"ip": RET_IP, "ttl": POS_TTL})
+    check("保留期到期后允许重新分配", code == 200, detail=f"code={code} body={body}")
+
+    print("\n== 10. 迟到的权威旧回包不得复活已退役的绑定 ==")
+    LATE_IP = "10.0.0.20"
+    set_record(d2, LATE_IP, POS_TTL)
+    set_delay(d2, 0)
+    wait_until(POS_TTL + 3, "d2 旧缓存到期", lambda: not stats(d2).get("cached"))
+    reply, _ = dns_query(d2, 3.0)
+    check("预备查询拿到旧绑定", reply is not None and answers_of(reply) == [LATE_IP],
+          detail=str(answers_of(reply) if reply else None))
+    wait_until(POS_TTL + 3, "d2 缓存再次到期", lambda: not stats(d2).get("cached"))
+    set_delay(d2, 1500)  # 权威 1.5s 后才回包：制造“退役后旧回包才到达”
+    late: list = []
+    t = threading.Thread(target=lambda: late.append(dns_query(d2, 8.0)))
+    t.start()
+    wait_until(3, "解析器回源中", lambda: stats(d2).get("inflight"))
+    code, body = retire_status(d2)
+    check("在途回源期间退役成功", code == 200 and body.get("ok"), detail=f"code={code} body={body}")
+    set_delay(d2, 0)  # 让解析器丢弃旧回包后的重试立即拿到权威当前状态
+    t.join()
+    reply, qid = late[0]
+    check("在途查询最终收到 NXDOMAIN 而非迟到的旧绑定",
+          reply is not None and reply.header.rcode == RCODE.NXDOMAIN and LATE_IP not in answers_of(reply),
+          detail=str(reply.header if reply else None))
+    check("答复 DNS ID 仍与查询一致", reply is not None and int(reply.header.id) == qid)
+    check("解析器丢弃了迟到的旧回包（late_drops>=1）",
+          full_stats().get("late_drops", 0) >= 1, detail=str(full_stats()))
+    reply2, _ = dns_query(d2, 3.0)
+    check("之后查询仍是 NXDOMAIN（旧绑定未从缓存复活）",
+          reply2 is not None and reply2.header.rcode == RCODE.NXDOMAIN and LATE_IP not in answers_of(reply2),
+          detail=str(answers_of(reply2) if reply2 else None))
+
+    print("\n== 11 预备：制造退役保留状态与缓存，供重启后验证 ==")
+    FINAL_IP = "10.0.0.10"
+    set_record(d1, FINAL_IP, 15)  # TTL=15s：保留期足够覆盖服务重启耗时
+    wait_until(POS_TTL + 3, "d1 旧缓存到期", lambda: not stats(d1).get("cached"))
+    reply, _ = dns_query(d1, 3.0)
+    check("重启前查询发出绑定", reply is not None and answers_of(reply) == [FINAL_IP],
+          detail=str(answers_of(reply) if reply else None))
+    code, body = retire_status(d1)
+    check("重启前退役成功", code == 200 and body.get("ok"), detail=f"code={code} body={body}")
+    rm = retired_map()
+    check("重启前保留期未过", FINAL_IP in rm and rm[FINAL_IP]["remaining"] > 0, detail=str(rm))
+    check("重启前解析器留有查询痕迹", bool(stats(d1)), detail=str(stats(d1)))
+    print("（请用 scripts/selftest.sh / selftest-local.sh 重启全部服务并执行 --restart-check）")
     summarize()
 
 

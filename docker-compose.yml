@@ -27,6 +27,11 @@ services:
       UPSTREAM_HOST: authoritative
       UPSTREAM_PORT: "53"
       UPSTREAM_TIMEOUT: "3.0"
+      # 仅用于答复日志（地址保留期依据）与退役名册读取；
+      # 缓存仍只在内存，容器重建即清空
+      DB_PATH: /data/dns.db
+    volumes:
+      - dns-data:/data
     ports:
       # 客户端真实 UDP 查询入口（网页后端也走这里）
       - "5354:53/udp"
@@ -34,7 +39,6 @@ services:
       - "8081:8081"
     networks:
       - dnsnet
-    # 不挂载任何卷：缓存只在内存，容器重建即清空
     restart: unless-stopped
 
   web:

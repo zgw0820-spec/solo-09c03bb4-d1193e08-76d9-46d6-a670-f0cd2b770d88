@@ -1,6 +1,8 @@
 """FastAPI 操作网页后端。
 
-- 管理两个固定域名的 A 记录（设置 / 删除）
+- 管理两个固定域名的 A 记录（设置 / 删除 / 退役）
+- 退役 = 撤销记录 + 保存地址保留期限（同一事务，失败一并回滚）；
+  保留期内拒绝把该地址写入任何 A 记录，到期自动放行
 - 配置负缓存 TTL、每个域名的权威回包延迟、丢包故障开关
 - 发起真实 UDP 查询（经缓存解析器），并汇总解析器侧的剩余 TTL / 回源次数
 """
@@ -8,6 +10,7 @@ import json
 import os
 import random
 import socket
+import time
 import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
@@ -88,6 +91,7 @@ def _resolver_stats(name: str | None = None) -> dict:
 
 @app.get("/api/state")
 def get_state():
+    now = time.time()
     conn = db.connect()
     try:
         domains = []
@@ -110,11 +114,23 @@ def get_state():
         settings = {
             "neg_ttl": db.get_int_setting(conn, "neg_ttl", config.DEFAULT_NEG_TTL),
         }
+        retired = [
+            {
+                "ip": r["ip"],
+                "name": r["name"],
+                "retired_at": r["retired_at"],
+                "hold_until": r["hold_until"],
+                "remaining": max(0, int(r["hold_until"] - now)),
+                "reallocatable": r["hold_until"] <= now,
+            }
+            for r in db.list_retired(conn)
+        ]
     finally:
         conn.close()
     return {
         "domains": domains,
         "settings": settings,
+        "retired": retired,
         "resolver": _resolver_stats(),
         "resolver_endpoint": f"{config.RESOLVER_HOST}:{config.RESOLVER_PORT}",
     }
@@ -124,6 +140,20 @@ def get_state():
 def set_record(name: str, body: RecordIn):
     n = _normalized(name)
     _valid_ipv4(body.ip)
+    conn = db.connect()
+    try:
+        hold = db.hold_until_for_ip(conn, body.ip)
+    finally:
+        conn.close()
+    now = time.time()
+    if hold is not None and hold > now:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"地址 {body.ip} 处于退役保留期，"
+                f"约 {int(hold - now) + 1} 秒后（{time.strftime('%H:%M:%S', time.localtime(hold))}）才可重新分配"
+            ),
+        )
     db.upsert_record(n, body.ip, body.ttl)
     return {"ok": True, "name": n, "ip": body.ip, "ttl": body.ttl}
 
@@ -133,6 +163,57 @@ def remove_record(name: str):
     n = _normalized(name)
     db.delete_record(n)
     return {"ok": True, "name": n}
+
+
+@app.post("/api/domains/{name}/retire")
+def retire(name: str):
+    """退役 A 记录：撤销记录 + 保存地址保留期限（同一事务，失败一并回滚）。
+
+    保留期 = 解析器已发出的含该地址的旧答复全部到期的时刻
+    （按发包时刻 + 报文 TTL 计算，另覆盖当前缓存剩余 TTL）。
+    """
+    n = _normalized(name)
+    conn = db.connect()
+    try:
+        row = db.get_record(conn, n)
+    finally:
+        conn.close()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"{n} 没有现行 A 记录，无法退役")
+    ip = row["ip"]
+
+    # 退役前读解析器缓存：已缓存未发完的答复，其到期不超过缓存条目自身到期
+    cache_remaining = 0
+    info = (_resolver_stats(n).get("names") or {}).get(n) or {}
+    if info.get("cached") and ip in (info.get("rdata") or []):
+        cache_remaining = int(info.get("ttl_remaining") or 0)
+
+    try:
+        result = db.retire_record(n, cache_remaining=cache_remaining)
+    except db.NoRecord:
+        raise HTTPException(status_code=404, detail=f"{n} 没有现行 A 记录，无法退役")
+    except db.RetireConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"地址 {ip} 仍被 {exc.other_name} 的现行 A 记录使用，拒绝退役",
+        )
+
+    # 提交后收紧：若竞态窗口内解析器又缓存了该绑定且到期更晚，延长保留期覆盖它
+    info2 = (_resolver_stats(n).get("names") or {}).get(n) or {}
+    if info2.get("cached") and ip in (info2.get("rdata") or []):
+        later = time.time() + int(info2.get("ttl_remaining") or 0)
+        if later > result["hold_until"]:
+            db.extend_hold(ip, later)
+            result["hold_until"] = later
+
+    return {
+        "ok": True,
+        "name": n,
+        "ip": ip,
+        "retired_at": result["retired_at"],
+        "hold_until": result["hold_until"],
+        "hold_seconds": max(0, int(result["hold_until"] - time.time())),
+    }
 
 
 @app.put("/api/settings/neg-ttl")
